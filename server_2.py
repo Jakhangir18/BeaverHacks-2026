@@ -96,9 +96,17 @@ AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE", "").strip()
 # noticed the loudness spike partway through.
 PREBUFFER_SEC = float(os.environ.get("PREBUFFER_SEC", "1.0"))
 
-# How much MORE audio to wait for after a trigger before transcribing.
-# Together with PREBUFFER_SEC this is the size of the chunk fed to STT.
-POSTBUFFER_SEC = float(os.environ.get("POSTBUFFER_SEC", "1.4"))
+# Minimum post-trigger capture window (seconds). The capture EXTENDS past
+# this while the user is still talking, up to POSTBUFFER_MAX_SEC.
+POSTBUFFER_SEC = float(os.environ.get("POSTBUFFER_SEC", "1.0"))
+
+# Hard cap on the post-trigger capture window. Long phrases like
+# "hey spoot watch out behind you" can take ~2s, but we never wait
+# longer than this even if loud audio keeps coming in.
+POSTBUFFER_MAX_SEC = float(os.environ.get("POSTBUFFER_MAX_SEC", "2.5"))
+
+# How often we re-check loudness while extending the post-trigger window.
+POSTBUFFER_TICK_SEC = 0.15
 
 # How many samples of recent audio to RMS-average for the loudness probe.
 VOLUME_WINDOW_SEC = 0.2
@@ -187,7 +195,9 @@ def rms(audio_array):
 # nothing for a 1-word fragment). By keeping the last PREBUFFER_SEC of
 # audio in memory at all times we can reach BACK in time once we trigger.
 
-_BUFFER_TOTAL_SEC = PREBUFFER_SEC + POSTBUFFER_SEC + 0.5  # small slack
+# Size for the worst case (max-extended capture) so we never lose pre-buffer
+# context even when the post-trigger window stretches to its cap.
+_BUFFER_TOTAL_SEC = PREBUFFER_SEC + POSTBUFFER_MAX_SEC + 0.5
 _MAX_BLOCKS = int(_BUFFER_TOTAL_SEC * SAMPLE_RATE / BLOCKSIZE) + 4
 
 _audio_blocks = collections.deque(maxlen=_MAX_BLOCKS)
@@ -355,12 +365,33 @@ def get_volume_level():
 async def capture_phrase():
     """
     Wait for the post-trigger window to roll into the buffer, then return
-    PREBUFFER_SEC of pre-trigger context + POSTBUFFER_SEC of post-trigger
-    audio.
+    pre-trigger context + post-trigger audio.
+
+    The post-trigger window is ADAPTIVE: it always waits at least
+    POSTBUFFER_SEC, then keeps extending in POSTBUFFER_TICK_SEC ticks while
+    the user is still loud, up to POSTBUFFER_MAX_SEC. That way short shouts
+    finish quickly and long phrases ("hey spoot watch out") still get fully
+    captured without us waiting MAX every time.
+
+    Returns (audio_array, post_seconds_actually_captured) so callers can log
+    how long the adaptive extension took.
     """
 
+    # Always wait the minimum first.
     await asyncio.sleep(POSTBUFFER_SEC)
-    return _snapshot_buffer(PREBUFFER_SEC + POSTBUFFER_SEC)
+    elapsed = POSTBUFFER_SEC
+
+    # Then extend in small ticks while we still hear talking.
+    while elapsed < POSTBUFFER_MAX_SEC:
+        if get_volume_level() < VOLUME_THRESHOLD:
+            break
+
+        wait = min(POSTBUFFER_TICK_SEC, POSTBUFFER_MAX_SEC - elapsed)
+        await asyncio.sleep(wait)
+        elapsed += wait
+
+    audio = _snapshot_buffer(PREBUFFER_SEC + elapsed)
+    return audio, elapsed
 
 
 def angle_difference(a, b):
@@ -409,20 +440,25 @@ def transcribe_audio(audio_array):
     Uses the SpeechRecognition library's free Google Web Speech endpoint
     with show_all=True so we get Google's full ranked list of hypotheses.
     For made-up names ("spoot") the top pick is often wrong but a lower
-    alternative ("spook") is closer — having all of them in the transcript
-    string lets fuzzy name matching still succeed.
+    alternative ("spook") is closer — keeping the full list lets us score
+    each hypothesis separately for name detection.
 
-    Returns a string (possibly empty) and never raises.
+    Returns (display, alternatives) where:
+      - display       is the user-visible transcript string (top + a few alts)
+      - alternatives  is the raw list of distinct hypothesis strings, used
+                      for per-alternative name scoring downstream.
+
+    Never raises. Empty audio or any STT failure returns ("", []).
     """
 
     if len(audio_array) == 0:
-        return ""
+        return "", []
 
     try:
         import speech_recognition as sr
     except ImportError:
         print("speech_recognition not installed; skipping transcription")
-        return ""
+        return "", []
 
     audio_int16 = np.clip(audio_array * 32767.0, -32768, 32767).astype(np.int16)
     audio_data = sr.AudioData(audio_int16.tobytes(), SAMPLE_RATE, 2)
@@ -432,46 +468,46 @@ def transcribe_audio(audio_array):
     try:
         result = recognizer.recognize_google(audio_data, show_all=True)
     except sr.UnknownValueError:
-        return ""
+        return "", []
     except sr.RequestError as exc:
         print(f"STT request error: {exc}")
-        return ""
+        return "", []
     except Exception as exc:
         print(f"STT unexpected error: {exc}")
-        return ""
+        return "", []
 
     if not result or not isinstance(result, dict):
-        return ""
+        return "", []
 
-    alternatives = result.get("alternative", [])
+    raw_alternatives = result.get("alternative", [])
     texts = [
         alt.get("transcript", "").strip()
-        for alt in alternatives
+        for alt in raw_alternatives
         if alt.get("transcript")
     ]
 
     if not texts:
-        return ""
+        return "", []
 
-    top = texts[0]
-
-    # Append distinct alternatives so fuzzy/keyword matching has more
-    # candidate words. Display-wise this looks like:
-    #     Foods (spooked / spook)
-    # which is also a useful debugging hint for the user.
-    seen = {top.lower()}
-    others = []
-    for t in texts[1:]:
-        if t.lower() in seen:
+    # Deduplicate while preserving Google's ranking.
+    seen = set()
+    distinct = []
+    for t in texts:
+        key = t.lower()
+        if key in seen:
             continue
-        seen.add(t.lower())
-        others.append(t)
-        if len(others) >= 3:
-            break
+        seen.add(key)
+        distinct.append(t)
+
+    top = distinct[0]
+    others = distinct[1:4]  # show up to 3 alternates
 
     if others:
-        return f"{top} ({' / '.join(others)})"
-    return top
+        display = f"{top} ({' / '.join(others)})"
+    else:
+        display = top
+
+    return display, distinct
 
 
 # =========================
@@ -486,43 +522,110 @@ def _name_targets():
 
     targets = [USER_NAME.lower()]
     targets.extend(a for a in USER_NAME_ALIASES if a)
-    return targets
+    return [t for t in targets if t]
 
 
-def detect_name(transcript):
+def _match_one_alternative(alt, targets):
     """
-    Return True if the transcript appears to contain the user's name.
+    Score a single STT alternative against every name target.
 
-    Three strategies, in order of confidence:
-      1. Direct substring match against USER_NAME or any USER_NAME_ALIASES.
-      2. Word-level fuzzy match (difflib ratio) against the same targets.
-         Catches close STT misreads like "spooked" vs "spoot" without
-         requiring you to anticipate every variation.
+    Returns the best match dict, or None.
+    Match dict shape:
+        {
+          "alternative": <original alt string>,
+          "target":      <which name/alias matched>,
+          "word":        <which transcript word matched>,
+          "ratio":       <0.0 - 1.0>,
+          "kind":        "substring" | "fuzzy",
+        }
     """
 
-    if not transcript:
-        return False
+    if not alt:
+        return None
 
-    text = transcript.lower()
-    targets = _name_targets()
+    text = alt.lower()
+    words = _WORD_RE.findall(text)
 
+    # Substring wins immediately (treat as ratio = 1.0).
     for target in targets:
-        if target and target in text:
-            return True
+        if target in text:
+            # Pick the actual word that contains the target if possible,
+            # otherwise just report the target as the matched word.
+            matched_word = next(
+                (w for w in words if target in w),
+                target,
+            )
+            return {
+                "alternative": alt,
+                "target": target,
+                "word": matched_word,
+                "ratio": 1.0,
+                "kind": "substring",
+            }
 
     if NAME_FUZZY_THRESHOLD <= 0:
-        return False
+        return None
 
-    words = _WORD_RE.findall(text)
+    best = None
     for word in words:
         for target in targets:
-            if not target:
-                continue
             ratio = difflib.SequenceMatcher(None, word, target).ratio()
-            if ratio >= NAME_FUZZY_THRESHOLD:
-                return True
+            if ratio < NAME_FUZZY_THRESHOLD:
+                continue
+            if best is None or ratio > best["ratio"]:
+                best = {
+                    "alternative": alt,
+                    "target": target,
+                    "word": word,
+                    "ratio": ratio,
+                    "kind": "fuzzy",
+                }
 
-    return False
+    return best
+
+
+def name_match_details(text_or_alts):
+    """
+    Score the user's name across one or many STT hypotheses.
+
+    Accepts:
+      - str:                 treated as a single alternative
+      - list/tuple of str:   each scored independently, best score wins
+
+    Scoring per-alternative is more accurate than concatenating them,
+    because spurious cross-word matches across the join boundary
+    ("spook / Foods" -> "kfoods") never happen.
+
+    Returns a match dict (see _match_one_alternative) or None.
+    """
+
+    if not text_or_alts:
+        return None
+
+    alternatives = [text_or_alts] if isinstance(text_or_alts, str) else list(text_or_alts)
+    targets = _name_targets()
+
+    if not targets:
+        return None
+
+    best = None
+    for alt in alternatives:
+        match = _match_one_alternative(alt, targets)
+        if match is None:
+            continue
+        # Substring wins absolutely.
+        if match["kind"] == "substring":
+            return match
+        if best is None or match["ratio"] > best["ratio"]:
+            best = match
+
+    return best
+
+
+def detect_name(text_or_alts):
+    """Bool form of name_match_details for backward compatibility."""
+
+    return name_match_details(text_or_alts) is not None
 
 
 def local_reason(transcript, angle, volume, name_detected):
@@ -654,7 +757,7 @@ def _fmt_classification(reasoning):
     )
 
 
-def _gemini_skip_reason(transcript):
+def _gemini_skip_reason(transcript, alternatives=None):
     """
     Decide whether to even attempt a Gemini call this event.
 
@@ -668,6 +771,9 @@ def _gemini_skip_reason(transcript):
         (random background chatter → local fallback is enough).
       - Circuit breaker open from a recent 429.
       - Called Gemini too recently (RPM throttle).
+
+    `alternatives` (optional list[str]) lets us score each STT hypothesis
+    independently for name detection — the more reliable signal.
     """
 
     if not GEMINI_API_KEY:
@@ -678,9 +784,11 @@ def _gemini_skip_reason(transcript):
 
     text = transcript.lower()
 
-    # Name match uses fuzzy + alias logic so we still call Gemini when
-    # STT returned a near-miss like "spooked" for "spoot".
-    if detect_name(transcript):
+    # Name match uses per-alternative fuzzy scoring when we have alternatives,
+    # falling back to the display string otherwise.
+    name_target = alternatives if alternatives else transcript
+
+    if detect_name(name_target):
         pass
     else:
         social_phrases = (
@@ -715,7 +823,7 @@ def _gemini_should_skip(transcript):
     return bool(_gemini_skip_reason(transcript))
 
 
-def call_gemini_blocking(transcript, angle, volume):
+def call_gemini_blocking(transcript, angle, volume, alternatives=None):
     """
     Synchronous Gemini REST call.
     Returns dict (matching the local-reason shape) or None on any failure.
@@ -727,7 +835,7 @@ def call_gemini_blocking(transcript, angle, volume):
 
     tag = _event_tag(angle, volume)
 
-    skip = _gemini_skip_reason(transcript)
+    skip = _gemini_skip_reason(transcript, alternatives=alternatives)
     if skip:
         print(f"{tag} gemini: SKIPPED ({skip})")
         return None
@@ -806,7 +914,7 @@ def call_gemini_blocking(transcript, angle, volume):
     return result
 
 
-async def call_gemini(transcript, angle, volume):
+async def call_gemini(transcript, angle, volume, alternatives=None):
     """
     Async wrapper around the blocking call. Adds a hard timeout
     so a hung HTTP request can never stall the pipeline.
@@ -814,7 +922,10 @@ async def call_gemini(transcript, angle, volume):
 
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(call_gemini_blocking, transcript, angle, volume),
+            asyncio.to_thread(
+                call_gemini_blocking,
+                transcript, angle, volume, alternatives,
+            ),
             timeout=GEMINI_TIMEOUT_SEC + 0.5,
         )
     except asyncio.TimeoutError:
@@ -874,8 +985,9 @@ async def enrich_event(angle, volume):
     main loop can keep watching for the next loud sound.
 
     Sequence:
-      1. Wait for the post-trigger audio to fill into the rolling buffer,
-         then snapshot pre+post audio and transcribe it.
+      1. Wait for the post-trigger audio to fill into the rolling buffer
+         (adaptive — extends while the user is still loud), then snapshot
+         pre+post audio and transcribe it.
       2. Local name + keyword detection -> push HUD update immediately.
       3. Call Gemini for higher-quality reasoning -> push final HUD update.
       4. On Gemini failure, the local reasoning becomes the final.
@@ -883,14 +995,25 @@ async def enrich_event(angle, volume):
 
     tag = _event_tag(angle, volume)
 
-    audio_array = await capture_phrase()
-    transcript = await asyncio.to_thread(transcribe_audio, audio_array)
-    name_detected = detect_name(transcript)
+    audio_array, post_sec = await capture_phrase()
+    transcript, alternatives = await asyncio.to_thread(transcribe_audio, audio_array)
+
+    # Per-alternative scoring for the wake word — much more reliable than
+    # checking the joined display string.
+    name_match = name_match_details(alternatives) if alternatives else None
+    name_detected = name_match is not None
 
     if transcript:
-        print(f"{tag} transcript: \"{transcript}\" (name_detected={name_detected})")
+        print(f"{tag} transcript: \"{transcript}\" (name_detected={name_detected}, post={post_sec:.2f}s)")
     else:
-        print(f"{tag} transcript: <empty>")
+        print(f"{tag} transcript: <empty> (post={post_sec:.2f}s)")
+
+    if name_match:
+        print(
+            f"{tag} name match: word={name_match['word']!r} "
+            f"target={name_match['target']!r} ratio={name_match['ratio']:.2f} "
+            f"({name_match['kind']}) in alt={name_match['alternative']!r}"
+        )
 
     local = local_reason(transcript, angle, volume, name_detected)
     print(f"{tag} local:  {_fmt_classification(local)}")
@@ -903,7 +1026,7 @@ async def enrich_event(angle, volume):
         reasoning=local,
     ))
 
-    gemini = await call_gemini(transcript, angle, volume)
+    gemini = await call_gemini(transcript, angle, volume, alternatives=alternatives)
 
     if gemini is None:
         # Local result becomes the final. Re-broadcast with stage=final
@@ -954,7 +1077,7 @@ async def poll_mic():
     last_enrich = 0.0
 
     while True:
-        # Volume is now a cheap read off the rolling buffer.
+        # Volume is a cheap read off the rolling buffer.
         volume = get_volume_level()
 
         if volume < VOLUME_THRESHOLD:
@@ -967,28 +1090,25 @@ async def poll_mic():
             await asyncio.sleep(POLL_INTERVAL)
             continue
 
-        should_send = (
+        now = time.monotonic()
+
+        # The directional broadcast is gated by angle change so we don't
+        # spam the HUD with identical "right" / "right" / "right" alerts
+        # while a sustained sound is going on.
+        should_broadcast_directional = (
             last_angle is None or
             angle_difference(angle, last_angle) >= MIN_ANGLE_CHANGE
         )
 
-        if not should_send:
-            await asyncio.sleep(POLL_INTERVAL)
-            continue
+        if should_broadcast_directional:
+            last_angle = angle
+            await broadcast(make_payload(angle, volume, stage="directional"))
+            print(f"{_event_tag(angle, volume)} 📡 directional alert → {len(CLIENTS)} client(s)")
 
-        last_angle = angle
-
-        # Step 1: IMMEDIATE directional alert.
-        # No transcription, no Gemini. The HUD lights up before we
-        # have any idea what was said or how important it is.
-        await broadcast(make_payload(angle, volume, stage="directional"))
-        print(f"{_event_tag(angle, volume)} 📡 directional alert → {len(CLIENTS)} client(s)")
-
-        # Step 2: Spawn enrichment as a background task. It self-captures
-        # from the rolling buffer (pre-trigger + post-trigger audio) so
-        # poll_mic doesn't have to wait for any recording to finish.
-        now = time.monotonic()
-
+        # Enrichment (STT + Gemini) is gated only by the cooldown — NOT by
+        # the angle filter. That way repeated calls from the same direction
+        # ("Carson? ... Carson!") still get transcribed and reasoned about,
+        # not silently dropped because the angle hasn't changed.
         if now - last_enrich >= ENRICH_COOLDOWN_SEC:
             last_enrich = now
             asyncio.create_task(enrich_event(angle, volume))
@@ -1012,7 +1132,7 @@ async def main():
     print(f"    FUZZY THRESH   = {NAME_FUZZY_THRESHOLD}")
     print(f"    GEMINI_MODEL   = {GEMINI_MODEL}")
     print(f"    GEMINI_KEY     = {'set' if GEMINI_API_KEY else 'NOT set (local fallback only)'}")
-    print(f"    AUDIO WINDOW   = {PREBUFFER_SEC:.2f}s pre + {POSTBUFFER_SEC:.2f}s post")
+    print(f"    AUDIO WINDOW   = {PREBUFFER_SEC:.2f}s pre + {POSTBUFFER_SEC:.2f}–{POSTBUFFER_MAX_SEC:.2f}s post (adaptive)")
 
     try:
         start_audio_stream()
