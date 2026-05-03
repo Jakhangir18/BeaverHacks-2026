@@ -4,6 +4,10 @@ numpy
 websockets
 SpeechRecognition
 
+# --- HTTP + static HUD (Flask app: /state, /, manifest) ---
+flask
+Flask-CORS
+
 # --- OLED HUD (oled_hud.py, Raspberry Pi only) ---
 # Comment these out when running server.py on a non-Pi development machine.
 adafruit-circuitpython-ssd1306

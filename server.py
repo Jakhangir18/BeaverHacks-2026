@@ -13,6 +13,8 @@ import urllib.request
 import numpy as np
 import sounddevice as sd
 import websockets
+from flask import Flask, jsonify, send_from_directory
+from flask_cors import CORS
 
 
 # =========================
@@ -65,6 +67,88 @@ _DOTENV_LOADED = _load_dotenv()
 XVF_HOST = '/home/rasberypi/Documents/reSpeaker_XVF3800_USB_4MIC_ARRAY/host_control/rpi_64bit/xvf_host'
 
 CLIENTS = set()
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# =========================
+# Flask PWA + continuous DOA (GET /state, static HUD)
+# =========================
+
+RMS_MIN = 0.003
+RMS_MAX = 0.05
+DANGER_THRESHOLD = 0.7
+
+_doa_azimuth_deg = 0.0
+_doa_lock = threading.Lock()
+
+
+def angle_to_direction_hud(angle):
+    """Labels for `index.html` DIRS map (matches former app.py naming)."""
+
+    boundaries = [
+        (22.5,  'front'),
+        (67.5,  'front-right'),
+        (112.5, 'right'),
+        (157.5, 'back-right'),
+        (202.5, 'back'),
+        (247.5, 'back-left'),
+        (292.5, 'left'),
+        (337.5, 'front-left'),
+        (360.0, 'front'),
+    ]
+    for threshold, name in boundaries:
+        if angle < threshold:
+            return name
+    return 'front'
+
+
+def _doa_poll_loop():
+    global _doa_azimuth_deg
+
+    while True:
+        try:
+            result = subprocess.run(
+                ['sudo', XVF_HOST, 'AEC_AZIMUTH_VALUES'],
+                capture_output=True, text=True, timeout=2,
+            )
+            matches = re.findall(r'\((\d+\.\d+) deg\)', result.stdout)
+            if matches:
+                angle = float(matches[-1]) % 360
+                with _doa_lock:
+                    _doa_azimuth_deg = angle
+        except Exception:
+            pass
+
+
+threading.Thread(target=_doa_poll_loop, daemon=True).start()
+
+app = Flask(__name__)
+CORS(app)
+
+
+@app.route('/state')
+def flask_state():
+    with _doa_lock:
+        angle = _doa_azimuth_deg
+    vol_raw = get_volume_level()
+    vol_norm = max(0.0, min(1.0, (vol_raw - RMS_MIN) / (RMS_MAX - RMS_MIN)))
+    direction = angle_to_direction_hud(angle) if vol_norm > 0.02 else None
+    return jsonify({
+        'direction': direction,
+        'angle': round(angle, 1),
+        'volume': round(vol_norm, 3),
+        'danger': vol_norm >= DANGER_THRESHOLD,
+    })
+
+
+@app.route('/')
+def flask_index():
+    return send_from_directory(_ROOT, 'index.html')
+
+
+@app.route('/manifest.json')
+def flask_manifest():
+    return send_from_directory(_ROOT, 'manifest.json')
 
 
 # =========================
@@ -278,21 +362,6 @@ _last_transcript = ""
 # =========================
 # DOA + audio capture
 # =========================
-
-def get_doa_angle():
-    result = subprocess.run(
-        ['sudo', XVF_HOST, 'AEC_AZIMUTH_VALUES'],
-        capture_output=True,
-        text=True
-    )
-
-    matches = re.findall(r'\((\d+\.\d+) deg\)', result.stdout)
-
-    if matches:
-        return float(matches[-1])
-
-    return None
-
 
 def rms(audio_array):
     if len(audio_array) == 0:
@@ -1152,11 +1221,8 @@ async def poll_mic():
             await asyncio.sleep(POLL_INTERVAL)
             continue
 
-        angle = await asyncio.to_thread(get_doa_angle)
-
-        if angle is None:
-            await asyncio.sleep(POLL_INTERVAL)
-            continue
+        with _doa_lock:
+            angle = _doa_azimuth_deg
 
         now = time.monotonic()
 
@@ -1177,8 +1243,25 @@ async def poll_mic():
         await asyncio.sleep(POLL_INTERVAL)
 
 
+def run_flask_server():
+    kwargs = dict(
+        host='0.0.0.0', port=5000, debug=False, threaded=True, use_reloader=False,
+    )
+    cert = os.path.join(_ROOT, '192.168.68.55.pem')
+    key = os.path.join(_ROOT, '192.168.68.55-key.pem')
+    if os.path.isfile(cert) and os.path.isfile(key):
+        kwargs['ssl_context'] = (cert, key)
+        print("🖥️  Flask HUD: https://0.0.0.0:5000  (/state, index.html)")
+    else:
+        print(
+            "🖥️  Flask HUD: http://0.0.0.0:5000  "
+            "(add 192.168.68.55.pem + key next to server.py for HTTPS)"
+        )
+    app.run(**kwargs)
+
+
 async def main():
-    print("🎙️  DOA WebSocket server starting on ws://0.0.0.0:8765")
+    print("🎙️  DOA WebSocket server starting on ws://0.0.0.0:8765 (+ Flask on :5000)")
 
     if _DOTENV_LOADED:
         print(f"    .env            = loaded {_DOTENV_LOADED} var(s)")
@@ -1215,6 +1298,8 @@ async def main():
         start_audio_stream()
     except Exception:
         return
+
+    threading.Thread(target=run_flask_server, daemon=True).start()
 
     try:
         async with websockets.serve(handle_client, "0.0.0.0", 8765):
