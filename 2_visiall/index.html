@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>SoundAR</title>
+  <link rel="manifest" href="manifest.json">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+
+    /* ── Force landscape when phone is portrait ── */
+    @media screen and (orientation: portrait) {
+      body {
+        transform: rotate(-90deg);
+        transform-origin: left top;
+        width: 100vh;
+        height: 100vw;
+        position: absolute;
+        top: 100%;
+        left: 0;
+        overflow: hidden;
+      }
+    }
+
+    #video {
+      position: fixed; top: 0; left: 0;
+      width: 100%; height: 100%;
+      object-fit: cover;
+    }
+    #ar {
+      position: fixed; top: 0; left: 0;
+      width: 100%; height: 100%;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+    #startBtn {
+      position: fixed;
+      bottom: 8%; left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,255,180,0.12);
+      border: 1px solid rgba(0,255,180,0.5);
+      color: #00ffb4;
+      font-family: 'Courier New', monospace;
+      font-size: 13px; letter-spacing: 3px;
+      padding: 11px 28px;
+      cursor: pointer; text-transform: uppercase;
+      z-index: 10;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #startBtn:active { background: rgba(0,255,180,0.28); }
+  </style>
+</head>
+<body>
+
+<video id="video" autoplay playsinline muted></video>
+<canvas id="ar"></canvas>
+<button id="startBtn">[ TAP TO START ]</button>
+
+<script>
+'use strict';
+
+/* ─────────────────────────── CAMERA ─────────────────────────── */
+const btn   = document.getElementById('startBtn');
+const video = document.getElementById('video');
+
+btn.addEventListener('click', async () => {
+  btn.textContent = '[ CONNECTING... ]';
+  try {
+    // Lock to landscape when running as PWA
+    if (screen.orientation && screen.orientation.lock) {
+      screen.orientation.lock('landscape').catch(() => {});
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' },
+               width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+    video.srcObject = stream;
+    btn.style.display = 'none';
+  } catch (e) {
+    btn.textContent = `[ ERR: ${e.message.slice(0, 42)} ]`;
+  }
+});
+
+/* ─────────────────────────── STATE ──────────────────────────── */
+let state = { direction: null, angle: null, volume: 0, danger: false };
+
+async function pollState() {
+  try {
+    const r = await fetch('/state');
+    if (r.ok) state = await r.json();
+  } catch (_) {}
+  setTimeout(pollState, 80);
+}
+pollState();
+
+/* ─────────────────────────── CANVAS ─────────────────────────── */
+const C   = document.getElementById('ar');
+const ctx = C.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+let W, H, CX, CY, S, PX;
+
+function resize() {
+  W  = C.width  = window.innerWidth;
+  H  = C.height = window.innerHeight;
+  CX = W / 2;
+  CY = H / 2;
+  S  = Math.min(W / 600, H / 320);        // scale vs 600×320 reference
+  PX = Math.max(2, Math.round(4 * S));
+}
+resize();
+window.addEventListener('resize', resize);
+
+function snap(v) { return Math.round(v / PX) * PX; }
+
+/* ─── geometry ─── */
+function RX()   { return 210 * S; }
+function RY()   { return 68  * S; }
+function TILT() { return 28  * S; }
+
+/* ─── color themes ─── */
+function col() {
+  return state.danger
+    ? { a: '#ff3333', b: '#ff7777', c: '#cc0000', d: '#ff0000' }
+    : { a: '#00ffb4', b: '#00ccff', c: '#007744', d: '#00ff88' };
+}
+
+/* ─── direction → ellipse angle ─── */
+const DIRS = {
+  'front':       -Math.PI / 2,
+  'front-right': -Math.PI / 4,
+  'right':        0,
+  'back-right':   Math.PI / 4,
+  'back':         Math.PI / 2,
+  'back-left':    3 * Math.PI / 4,
+  'left':         Math.PI,
+  'front-left':  -3 * Math.PI / 4,
+};
+
+/* ═══════════════════════ DRAW HELPERS ═══════════════════════ */
+
+function drawEllipseArc(a0, a1, rScale, lineW, color, alpha, steps) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = lineW;
+  ctx.globalAlpha = alpha;
+  ctx.beginPath();
+  for (let i = 0; i <= steps; i++) {
+    const a = a0 + (a1 - a0) * (i / steps);
+    const x = snap(CX + Math.cos(a) * RX() * rScale);
+    const y = snap(CY + TILT() + Math.sin(a) * RY() * rScale);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawSegment3D(angle, isActive, pulse) {
+  const c      = col();
+  const half   = Math.PI / 8 - 0.08;
+  const a0     = angle - half, a1 = angle + half;
+  const steps  = 20;
+  const outer  = 1.0, inner = 0.72;
+  const bandH  = (Math.sin(angle) > 0 ? 24 : 14) * S;   // front segs taller
+
+  if (!isActive) {
+    drawEllipseArc(a0, a1, outer, PX * 2, 'rgba(255,255,255,0.08)', 1, steps);
+    drawEllipseArc(a0, a1, inner, PX,     'rgba(255,255,255,0.05)', 1, steps);
+    return;
+  }
+
+  /* bottom depth face */
+  function face(scale, dy, alpha, color) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle   = color;
+    ctx.beginPath();
+    for (let i = 0; i <= steps; i++) {
+      const a = a0 + (a1 - a0) * (i / steps);
+      const x = snap(CX + Math.cos(a) * RX() * scale);
+      const y = snap(CY + TILT() + Math.sin(a) * RY() * scale) + dy;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    for (let i = steps; i >= 0; i--) {
+      const a = a0 + (a1 - a0) * (i / steps);
+      const x = snap(CX + Math.cos(a) * RX() * scale);
+      const y = snap(CY + TILT() + Math.sin(a) * RY() * scale);
+      ctx.lineTo(x, y);
+    }
+    ctx.closePath(); ctx.fill(); ctx.restore();
+  }
+
+  face(outer, bandH, 0.35 + 0.15 * pulse, c.c);
+  face(inner, bandH, 0.20 + 0.10 * pulse, c.c);
+
+  /* top bright surface */
+  ctx.save();
+  ctx.globalAlpha = 0.55 + 0.40 * pulse;
+  ctx.fillStyle   = c.a;
+  ctx.beginPath();
+  for (let i = 0; i <= steps; i++) {
+    const a = a0 + (a1 - a0) * (i / steps);
+    const x = snap(CX + Math.cos(a) * RX() * outer);
+    const y = snap(CY + TILT() + Math.sin(a) * RY() * outer);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  for (let i = steps; i >= 0; i--) {
+    const a = a0 + (a1 - a0) * (i / steps);
+    const x = snap(CX + Math.cos(a) * RX() * inner);
+    const y = snap(CY + TILT() + Math.sin(a) * RY() * inner);
+    ctx.lineTo(x, y);
+  }
+  ctx.closePath(); ctx.fill(); ctx.restore();
+
+  /* retro scanlines */
+  for (let i = 0; i <= steps; i += 3) {
+    const a  = a0 + (a1 - a0) * (i / steps);
+    const x1 = snap(CX + Math.cos(a) * RX() * inner);
+    const y1 = snap(CY + TILT() + Math.sin(a) * RY() * inner);
+    const x2 = snap(CX + Math.cos(a) * RX() * outer);
+    const y2 = snap(CY + TILT() + Math.sin(a) * RY() * outer);
+    ctx.save();
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth   = PX * 0.5;
+    ctx.globalAlpha = 0.25;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    ctx.restore();
+  }
+
+  /* bright edges */
+  drawEllipseArc(a0, a1, outer, PX * 2, c.b, 0.8 + 0.2 * pulse, steps);
+  drawEllipseArc(a0, a1, inner, PX,     c.a, 0.5 + 0.3 * pulse, steps);
+}
+
+/* radial pixel bars */
+function drawPixelBars(ts, activeAngle) {
+  if (activeAngle === null) return;
+  const c     = col();
+  const pulse = 0.5 + 0.5 * Math.sin(ts / 300);
+  const count = 18;
+  const spread = Math.PI * 0.42;
+
+  for (let i = 0; i < count; i++) {
+    const t      = i / (count - 1);
+    const a      = activeAngle - spread / 2 + t * spread;
+    const dist   = Math.abs(t - 0.5) * 2;
+    const maxLen = (1 - dist * dist) * 52 * S * (0.3 + 0.7 * pulse);
+    const bx     = snap(CX + Math.cos(a) * RX() * 1.02);
+    const by     = snap(CY + TILT() + Math.sin(a) * RY() * 1.02);
+    const ex     = snap(bx + Math.cos(a) * maxLen);
+    const ey     = snap(by + Math.sin(a) * maxLen * 0.55);
+    const barLen = Math.hypot(ex - bx, ey - by);
+    const steps  = Math.floor(barLen / PX);
+    const ci     = i % 3 === 0 ? c.a : i % 3 === 1 ? c.b : c.d;
+
+    for (let s = 0; s < steps; s++) {
+      const tt = s / Math.max(steps, 1);
+      const px = snap(bx + (ex - bx) * tt);
+      const py = snap(by + (ey - by) * tt);
+      ctx.save();
+      ctx.fillStyle   = ci;
+      ctx.globalAlpha = (1 - tt * 0.6) * (0.5 + 0.5 * pulse) * (1 - dist * 0.5);
+      ctx.fillRect(px - PX / 2, py - PX / 2, PX, PX);
+      ctx.restore();
+    }
+  }
+}
+
+/* rotating background rings */
+function drawBgRings(ts) {
+  const c = col();
+  [
+    { s: 0.52, segs: 24, w: PX,     sp:  0.20, al: 0.07 },
+    { s: 0.62, segs: 18, w: PX * 2, sp: -0.15, al: 0.06 },
+    { s: 0.75, segs: 14, w: PX,     sp:  0.10, al: 0.05 },
+    { s: 0.88, segs: 10, w: PX * 2, sp: -0.08, al: 0.06 },
+  ].forEach(r => {
+    const rot  = ts * 0.0003 * r.sp;
+    const segA = Math.PI * 2 / r.segs;
+    const gap  = segA * 0.35;
+    for (let s = 0; s < r.segs; s++) {
+      const a0 = rot + s * segA + gap / 2;
+      drawEllipseArc(a0, a0 + segA - gap, r.s, r.w, c.a, r.al, 12);
+    }
+  });
+}
+
+/* subtle pixel grid overlay */
+function drawPixelGrid() {
+  ctx.save();
+  ctx.globalAlpha = 0.025;
+  ctx.fillStyle   = '#00ffb4';
+  for (let x = 0; x < W; x += PX * 4) ctx.fillRect(x, 0, 1, H);
+  for (let y = 0; y < H; y += PX * 4) ctx.fillRect(0, y, W, 1);
+  ctx.restore();
+}
+
+/* direction label */
+function drawLabel(ts, activeAngle) {
+  const dir = state.direction;
+  if (!dir || activeAngle === null) return;
+  const c     = col();
+  const pulse = 0.5 + 0.5 * Math.sin(ts / 400);
+  const lx    = snap(CX + Math.cos(activeAngle) * RX() * 1.48);
+  const ly    = snap(CY + TILT() + Math.sin(activeAngle) * RY() * 1.48);
+  const fs    = Math.max(10, Math.round(10 * S));
+
+  ctx.save();
+  ctx.textAlign    = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font         = `${fs}px monospace`;
+  ctx.fillStyle    = c.a;
+  ctx.globalAlpha  = 0.7 + 0.3 * pulse;
+  ctx.fillText(dir.toUpperCase().replace('-', ' '), lx, ly);
+  ctx.font         = `${Math.max(9, Math.round(9 * S))}px monospace`;
+  ctx.fillStyle    = c.b;
+  ctx.globalAlpha  = 0.5 + 0.3 * pulse;
+  ctx.fillText(Math.round(state.angle || 0) + '°', lx, ly + 14 * S);
+  ctx.restore();
+}
+
+/* ═══════════════════════ MAIN LOOP ══════════════════════════ */
+function frame(ts) {
+  ctx.clearRect(0, 0, W, H);
+
+  const dir         = state.volume > 0.03 ? state.direction : null;
+  const activeAngle = dir ? DIRS[dir] : null;
+  const pulse       = 0.5 + 0.5 * Math.sin(ts / 320);
+
+  drawPixelGrid();
+  drawBgRings(ts);
+
+  /* painter's algorithm: draw back segments first */
+  Object.entries(DIRS)
+    .sort((a, b) => Math.sin(a[1]) - Math.sin(b[1]))
+    .forEach(([d, angle]) => drawSegment3D(angle, d === dir, pulse));
+
+  drawPixelBars(ts, activeAngle);
+  drawLabel(ts, activeAngle);
+
+  requestAnimationFrame(frame);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
