@@ -1,0 +1,47 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+
+# Test/cache files
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local audio/data output files
+*.wav
+*.mp3
+*.csv
+*.jsonl
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
