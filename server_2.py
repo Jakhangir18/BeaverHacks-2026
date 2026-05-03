@@ -85,8 +85,14 @@ SAMPLE_RATE = 16000
 # Block size of the continuous mic stream (~64 ms at 16 kHz).
 BLOCKSIZE = 1024
 
+# Optional audio device override. Accepts:
+#   - integer index (e.g. AUDIO_DEVICE=1)
+#   - device name substring (e.g. AUDIO_DEVICE="XVF3800")
+# Leave blank to auto-pick the first input-capable device.
+AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE", "").strip()
+
 # How much PRE-trigger audio to keep in the rolling buffer. This is what
-# gives us the start of a phrase ("hey carson...") even though we only
+# gives us the start of a phrase ("hey spoot...") even though we only
 # noticed the loudness spike partway through.
 PREBUFFER_SEC = float(os.environ.get("PREBUFFER_SEC", "1.0"))
 
@@ -106,7 +112,7 @@ ENRICH_COOLDOWN_SEC = float(os.environ.get("ENRICH_COOLDOWN_SEC", "4.0"))
 # =========================
 
 # Default user name used when matching transcripts. Override with env var.
-USER_NAME = os.environ.get("USER_NAME", "Carson")
+USER_NAME = os.environ.get("USER_NAME", "Spoot")
 
 # Comma-separated list of known STT misreads of USER_NAME. STT is heavily
 # biased toward real English words; for made-up or rare names ("spoot")
@@ -175,7 +181,7 @@ def rms(audio_array):
 
 # ----- Rolling audio buffer fed by a continuous InputStream -----
 #
-# Why a rolling buffer? When the user shouts "hey carson watch out", the
+# Why a rolling buffer? When the user shouts "hey spott watch out", the
 # loudness threshold trips midway through the phrase. If we only captured
 # audio AFTER the trigger we'd miss "hey" (and Google STT often returns
 # nothing for a 1-word fragment). By keeping the last PREBUFFER_SEC of
@@ -196,6 +202,75 @@ def _audio_callback(indata, frames, time_info, status):
         _audio_blocks.append(block)
 
 
+def _list_input_devices():
+    """Return [(index, info_dict), ...] for devices that have input channels."""
+
+    try:
+        devices = sd.query_devices()
+    except Exception as exc:
+        print(f"warning: couldn't query audio devices: {exc}")
+        return []
+
+    out = []
+    for idx, info in enumerate(devices):
+        if info.get("max_input_channels", 0) > 0:
+            out.append((idx, info))
+    return out
+
+
+def _resolve_audio_device():
+    """
+    Pick a device to feed sd.InputStream(device=...). Strategy:
+
+      1. Honor AUDIO_DEVICE env var if set (numeric index or name substring).
+      2. Use sd.default.device[0] if it's a valid index (some PortAudio
+         setups return -1 here meaning "no default", which we must avoid).
+      3. Fall back to the first device that has input channels.
+      4. Return None as last resort and let sounddevice choose (may fail).
+    """
+
+    inputs = _list_input_devices()
+
+    if AUDIO_DEVICE:
+        try:
+            idx = int(AUDIO_DEVICE)
+            return idx
+        except ValueError:
+            pass
+
+        needle = AUDIO_DEVICE.lower()
+        for idx, info in inputs:
+            if needle in info.get("name", "").lower():
+                return idx
+
+        print(f"warning: AUDIO_DEVICE={AUDIO_DEVICE!r} did not match any input device")
+
+    try:
+        default = sd.default.device
+        default_in = default[0] if isinstance(default, (list, tuple)) else default
+        if isinstance(default_in, int) and default_in >= 0:
+            return default_in
+    except Exception:
+        pass
+
+    if inputs:
+        return inputs[0][0]
+
+    return None
+
+
+def _print_device_list():
+    inputs = _list_input_devices()
+    if not inputs:
+        print("  (no input-capable devices found)")
+        return
+    for idx, info in inputs:
+        name = info.get("name", "?")
+        ch = info.get("max_input_channels", 0)
+        rate = int(info.get("default_samplerate", 0))
+        print(f"  [{idx}] {name}  ({ch} ch, default {rate} Hz)")
+
+
 def start_audio_stream():
     """Open the single continuous mic stream that feeds the rolling buffer."""
 
@@ -204,14 +279,37 @@ def start_audio_stream():
     if _audio_stream is not None:
         return
 
-    _audio_stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype='float32',
-        blocksize=BLOCKSIZE,
-        callback=_audio_callback,
-    )
-    _audio_stream.start()
+    device = _resolve_audio_device()
+
+    try:
+        _audio_stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype='float32',
+            blocksize=BLOCKSIZE,
+            device=device,
+            callback=_audio_callback,
+        )
+        _audio_stream.start()
+    except Exception as exc:
+        print()
+        print(f"ERROR: couldn't open audio stream on device {device!r}: {exc}")
+        print("Available input devices:")
+        _print_device_list()
+        print()
+        print("Fix: set AUDIO_DEVICE=<index or name substring> in your .env")
+        print("     e.g.  AUDIO_DEVICE=1")
+        print("     or    AUDIO_DEVICE=XVF3800")
+        raise
+
+    # Resolve back to a friendly name for the startup banner.
+    try:
+        info = sd.query_devices(device) if device is not None else sd.query_devices(kind="input")
+        name = info.get("name", str(device))
+    except Exception:
+        name = str(device)
+
+    print(f"    AUDIO_DEVICE   = [{device}] {name}")
 
 
 def stop_audio_stream():
@@ -442,7 +540,7 @@ def local_reason(transcript, angle, volume, name_detected):
             "event_type": "speech",
             "directed_at_user": True,
             "importance": "high",
-            "message": f"{USER_NAME} called from {where}",
+            "message": f"Your name was called from {where}",
         }
 
     if any(phrase in text for phrase in URGENT_PHRASES):
@@ -916,7 +1014,11 @@ async def main():
     print(f"    GEMINI_KEY     = {'set' if GEMINI_API_KEY else 'NOT set (local fallback only)'}")
     print(f"    AUDIO WINDOW   = {PREBUFFER_SEC:.2f}s pre + {POSTBUFFER_SEC:.2f}s post")
 
-    start_audio_stream()
+    try:
+        start_audio_stream()
+    except Exception:
+        # The detailed message and device list have already been printed.
+        return
 
     try:
         async with websockets.serve(handle_client, "0.0.0.0", 8765):
