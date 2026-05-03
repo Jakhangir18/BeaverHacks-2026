@@ -1,0 +1,11 @@
+# --- Core server (server.py) ---
+sounddevice
+numpy
+websockets
+SpeechRecognition
+
+# --- OLED HUD (oled_hud.py, Raspberry Pi only) ---
+# Comment these out when running server.py on a non-Pi development machine.
+adafruit-circuitpython-ssd1306
+adafruit-blinka
+Pillow
