@@ -86,12 +86,61 @@ btn.addEventListener('click', async () => {
 });
 
 /* ─────────────────────────── STATE ──────────────────────────── */
-let state = { direction: null, angle: null, volume: 0, danger: false };
+/** How long Gemini/OLED-style HUD text stays on the AR banner (client-side). */
+const HUD_MESSAGE_MS = 4000;
+
+let state = {
+  direction: null,
+  angle: null,
+  volume: 0,
+  danger: false,
+  stage: null,
+  hud_message: '',
+  importance: 'low',
+  transcript: '',
+  hud_ts: null,
+};
+
+/** Monotonic deadline; banner hidden when `performance.now()` >= this. */
+let hudHideAfter = 0;
+let lastHudEventKey = '';
+
+function hudContextBannerVisible() {
+  return !!(
+    state.hud_message
+    && hudHideAfter > 0
+    && performance.now() < hudHideAfter
+  );
+}
 
 async function pollState() {
   try {
     const r = await fetch('/state');
-    if (r.ok) state = await r.json();
+    if (r.ok) {
+      const d = await r.json();
+      const msg = (d.hud_message || '').trim();
+      state = {
+        direction: d.direction ?? null,
+        angle: d.angle ?? null,
+        volume: d.volume ?? 0,
+        danger: !!d.danger,
+        stage: d.stage ?? null,
+        hud_message: msg,
+        importance: d.importance || 'low',
+        transcript: d.transcript || '',
+        hud_ts: d.hud_ts ?? null,
+      };
+      if (!msg) {
+        hudHideAfter = 0;
+        lastHudEventKey = '';
+      } else {
+        const key = `${state.hud_ts ?? 'na'}|${msg}|${state.stage ?? ''}`;
+        if (key !== lastHudEventKey) {
+          lastHudEventKey = key;
+          hudHideAfter = performance.now() + HUD_MESSAGE_MS;
+        }
+      }
+    }
   } catch (_) {}
   setTimeout(pollState, 80);
 }
@@ -124,7 +173,9 @@ function TILT() { return 28  * S; }
 
 /* ─── color themes ─── */
 function col() {
-  return state.danger
+  const urgent = state.danger
+    || (hudContextBannerVisible() && state.importance === 'high');
+  return urgent
     ? { a: '#ff3333', b: '#ff7777', c: '#cc0000', d: '#ff0000' }
     : { a: '#00ffb4', b: '#00ccff', c: '#007744', d: '#00ff88' };
 }
@@ -299,6 +350,66 @@ function drawPixelGrid() {
   ctx.restore();
 }
 
+/* Gemini / OLED-matched context banner (message only, like show_frame with body text) */
+function wrapHudLines(text, maxWidth) {
+  const words = text.split(/\s+/).filter(Boolean);
+  const lines = [];
+  let cur = '';
+  words.forEach((w) => {
+    const next = cur ? `${cur} ${w}` : w;
+    if (ctx.measureText(next).width <= maxWidth || !cur) cur = next;
+    else {
+      lines.push(cur);
+      cur = w;
+    }
+  });
+  if (cur) lines.push(cur);
+  return lines.slice(0, 3);
+}
+
+function drawHudMessage(ts) {
+  if (!hudContextBannerVisible()) return;
+
+  const msg = state.hud_message;
+  const c = col();
+  const pulse = 0.5 + 0.5 * Math.sin(ts / 420);
+  const fs = Math.max(11, Math.round(12 * S));
+  const maxW = W * 0.86;
+  const padX = 18 * S;
+  const padY = 12 * S;
+
+  ctx.save();
+  ctx.font = `${fs}px monospace`;
+  const lines = wrapHudLines(msg, maxW - padX * 2);
+  const lineH = fs * 1.28;
+  const boxH = lines.length * lineH + padY * 2;
+  const boxW = Math.min(maxW, W - 24 * S);
+  const bx = (W - boxW) / 2;
+  const by = H * 0.56;
+
+  ctx.globalAlpha = 0.88 + 0.12 * pulse;
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(bx, by, boxW, boxH);
+
+  ctx.strokeStyle = c.a;
+  ctx.lineWidth = (hudContextBannerVisible() && state.importance === 'high')
+    ? Math.max(4, PX * 1.1)
+    : Math.max(2, PX * 0.5);
+  ctx.globalAlpha = 0.75 + 0.25 * pulse;
+  ctx.strokeRect(bx, by, boxW, boxH);
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.globalAlpha = 0.92;
+  let y = by + padY + lineH * 0.5;
+  lines.forEach((line) => {
+    ctx.fillStyle = c.b;
+    ctx.fillText(line, CX, y);
+    y += lineH;
+  });
+  ctx.restore();
+}
+
 /* direction label */
 function drawLabel(ts, activeAngle) {
   const dir = state.direction;
@@ -341,6 +452,7 @@ function frame(ts) {
 
   drawPixelBars(ts, activeAngle);
   drawLabel(ts, activeAngle);
+  drawHudMessage(ts);
 
   requestAnimationFrame(frame);
 }

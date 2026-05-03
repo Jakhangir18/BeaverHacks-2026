@@ -66,6 +66,20 @@ _DOTENV_LOADED = _load_dotenv()
 
 XVF_HOST = '/home/rasberypi/Documents/reSpeaker_XVF3800_USB_4MIC_ARRAY/host_control/rpi_64bit/xvf_host'
 
+# When the mic array is mounted upside down, hardware left/right are reversed.
+# We mirror azimuth: logical_angle = (360 - raw) % 360. Set DOA_FLIP_LEFT_RIGHT=0 if yours is correct.
+DOA_FLIP_LEFT_RIGHT = os.environ.get("DOA_FLIP_LEFT_RIGHT", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+
+def _logical_azimuth_from_hardware_deg(raw_deg):
+    a = float(raw_deg) % 360.0
+    if DOA_FLIP_LEFT_RIGHT:
+        return (360.0 - a) % 360.0
+    return a
+
+
 CLIENTS = set()
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -113,7 +127,7 @@ def _doa_poll_loop():
             )
             matches = re.findall(r'\((\d+\.\d+) deg\)', result.stdout)
             if matches:
-                angle = float(matches[-1]) % 360
+                angle = _logical_azimuth_from_hardware_deg(float(matches[-1]))
                 with _doa_lock:
                     _doa_azimuth_deg = angle
         except Exception:
@@ -133,11 +147,36 @@ def flask_state():
     vol_raw = get_volume_level()
     vol_norm = max(0.0, min(1.0, (vol_raw - RMS_MIN) / (RMS_MAX - RMS_MIN)))
     direction = angle_to_direction_hud(angle) if vol_norm > 0.02 else None
+
+    with _hud_mirror_lock:
+        mirror = dict(_hud_mirror) if _hud_mirror is not None else {}
+
+    stage = mirror.get("stage")
+    raw_msg = (mirror.get("message") or "").strip()
+    # Match oled_hud_2: directional frames clear the context message.
+    if stage == "directional":
+        hud_message = ""
+        importance = "low"
+        transcript = ""
+    else:
+        hud_message = raw_msg
+        importance = mirror.get("importance") or "low"
+        if importance not in ("low", "medium", "high"):
+            importance = "low"
+        transcript = mirror.get("transcript") or ""
+
     return jsonify({
         'direction': direction,
         'angle': round(angle, 1),
         'volume': round(vol_norm, 3),
         'danger': vol_norm >= DANGER_THRESHOLD,
+        'stage': stage,
+        'hud_message': hud_message,
+        'importance': importance,
+        'transcript': transcript,
+        'event_type': mirror.get("event_type"),
+        'directed_at_user': bool(mirror.get("directed_at_user", False)),
+        'hud_ts': mirror.get("ts"),
     })
 
 
@@ -149,6 +188,12 @@ def flask_index():
 @app.route('/manifest.json')
 def flask_manifest():
     return send_from_directory(_ROOT, 'manifest.json')
+
+
+# Last WebSocket HUD payload (Gemini/local context) — mirrored on GET /state for
+# the AR PWA when no WS client is connected, or for simpler same-origin polling.
+_hud_mirror_lock = threading.Lock()
+_hud_mirror = None
 
 
 # =========================
@@ -1100,7 +1145,18 @@ def make_payload(angle, volume, *, stage, transcript="",
     return payload
 
 
+def _record_hud_mirror(payload):
+    """Keep a copy of the latest HUD payload for HTTP /state (AR PWA polling)."""
+
+    global _hud_mirror
+
+    with _hud_mirror_lock:
+        _hud_mirror = dict(payload)
+
+
 async def broadcast(payload):
+    _record_hud_mirror(payload)
+
     if not CLIENTS:
         return
 
@@ -1280,6 +1336,7 @@ async def main():
     print(f"    GEMINI_KEY      = {'set' if GEMINI_API_KEY else 'NOT set (local fallback only)'}")
     print(f"    AUDIO WINDOW    = {PREBUFFER_SEC:.2f}s pre + {POSTBUFFER_SEC:.2f}–{POSTBUFFER_MAX_SEC:.2f}s post (adaptive)")
     print(f"    ENRICH_COOLDOWN = {ENRICH_COOLDOWN_SEC:.1f}s  |  DEDUP_THRESH = {TRANSCRIPT_DEDUP_THRESHOLD:.2f}")
+    print(f"    DOA_FLIP_LR     = {'on (hardware L/R mirrored)' if DOA_FLIP_LEFT_RIGHT else 'off'}")
 
     # Eagerly load heavy models at startup so the first real event isn't slow.
     print("    Pre-loading models …")
