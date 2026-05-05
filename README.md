@@ -1,4 +1,4 @@
-# SPOOT: Sound Point Of Origin Tracker
+# SPOOT: Sound Point Of Origin Tracker - [Demo](https://www.youtube.com/watch?v=r0NJpTgAblA)
 
 SPOOT is built around **Gemini**. The Pi captures sound and direction; **Whisper** turns audio into text on-device; **Gemini** interprets transcript, angle, and loudness together and replies with tight, structured HUD copy so people who are deaf in one ear (or juggling noise) instantly know whether to look, and how urgent it is.
 
